@@ -1,95 +1,107 @@
 import re
-import openpyxl
+import io
+import pandas as pd
 import pdfplumber
+import openpyxl
+import streamlit as st
 
-def extract_drawing_data(pdf_path):
-    """PDF 도면에서 HANGER & SNUBBER DATA 수치를 정밀 추출하는 함수"""
-    extracted_data = {
-        "SUPPORT_TAG": None,
-        "SPRING_RATE": None,
-        "HOT_LOAD": None,
-        "COLD_LOAD": None,
-        "HOT_POINT": None,
-        "COLD_POINT": None
+st.set_page_config(page_title="도면 데이터 자동 추출기", layout="wide")
+st.title("📐 Pipe Support 도면 일괄 분석 및 엑셀 리스트업")
+
+# 1. 파일 업로드 (여러 도면 동시 선택 가능)
+uploaded_pdfs = st.file_uploader(
+    "도면 PDF 파일들을 업로드하세요 (여러 개 선택 가능)", 
+    type=["pdf"], 
+    accept_multiple_files=True
+)
+
+def extract_7_fields(pdf_file):
+    """PDF 도면에서 요구되는 7가지 핵심 항목을 정밀 추출하는 함수"""
+    data = {
+        "파일명": pdf_file.name,
+        "1. SUPPORT TAG NO": None,
+        "2. Type & Size": None,
+        "3. Spring Rate (N/mm)": None,
+        "4. Hot Load (N)": None,
+        "5. Cold Load (N)": None,
+        "6. Hot Point (mm)": None,
+        "7. Cold Point (mm)": None
     }
     
-    with pdfplumber.open(pdf_path) as pdf:
-        page = pdf.pages[0]
-        text = page.extract_text()
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            
+            # 1. SUPPORT TAG NO.
+            if not data["1. SUPPORT TAG NO"]:
+                tag_match = re.search(r'SUPPORT\s*TAG\.?\s*NO\.?\s*[:\s]*([A-Z0-9-]+)', text, re.IGNORECASE)
+                if tag_match:
+                    data["1. SUPPORT TAG NO"] = tag_match.group(1).strip()
+            
+            # 2. Type & Size (서포트 모델 타입)
+            if not data["2. Type & Size"]:
+                type_match = re.search(r'(?:VT|VC|VA|CS|CH|CHT)-[\w-]+', text)
+                if type_match:
+                    data["2. Type & Size"] = type_match.group(0).strip()
+            
+            # 3. SPRING RATE
+            if data["3. Spring Rate (N/mm)"] is None:
+                spring_match = re.search(r'SPRING\s*RATE\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
+                if spring_match:
+                    data["3. Spring Rate (N/mm)"] = float(spring_match.group(1))
+            
+            # 4. HOT LOAD
+            if data["4. Hot Load (N)"] is None:
+                hot_load_match = re.search(r'HOT\s*LOAD\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
+                if hot_load_match:
+                    data["4. Hot Load (N)"] = float(hot_load_match.group(1))
+            
+            # 5. COLD LOAD
+            if data["5. Cold Load (N)"] is None:
+                cold_load_match = re.search(r'COLD\s*LOAD\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
+                if cold_load_match:
+                    data["5. Cold Load (N)"] = float(cold_load_match.group(1))
+            
+            # 6. HOT POINT
+            if data["6. Hot Point (mm)"] is None:
+                hot_point_match = re.search(r'HOT\s*POINT\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
+                if hot_point_match:
+                    data["6. Hot Point (mm)"] = float(hot_point_match.group(1))
+            
+            # 7. COLD POINT
+            if data["7. Cold Point (mm)"] is None:
+                cold_point_match = re.search(r'COLD\s*POINT\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
+                if cold_point_match:
+                    data["7. Cold Point (mm)"] = float(cold_point_match.group(1))
+
+    return data
+
+# 2. 실행 및 결과 다운로드
+if uploaded_pdfs:
+    if st.button("🚀 업로드한 도면 전체 분석 및 엑셀 생성"):
+        results = []
+        progress_bar = st.progress(0)
         
-        # 1. SUPPORT TAG NO. 추출
-        tag_match = re.search(r'SUPPORT\s*TAG\.?\s*NO\.?\s*[:\s]*([A-Z0-9-]+)', text, re.IGNORECASE)
-        if tag_match:
-            extracted_data["SUPPORT_TAG"] = tag_match.group(1).strip()
+        for idx, pdf in enumerate(uploaded_pdfs):
+            res = extract_7_fields(pdf)
+            results.append(res)
+            progress_bar.progress((idx + 1) / len(uploaded_pdfs))
             
-        # 2. SPRING RATE (N/mm) 추출
-        spring_match = re.search(r'SPRING\s*RATE\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
-        if spring_match:
-            extracted_data["SPRING_RATE"] = float(spring_match.group(1))
-            
-        # 3. HOT LOAD (N) 추출
-        hot_load_match = re.search(r'HOT\s*LOAD\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
-        if hot_load_match:
-            extracted_data["HOT_LOAD"] = float(hot_load_match.group(1))
-            
-        # 4. COLD LOAD (N) 추출
-        cold_load_match = re.search(r'COLD\s*LOAD\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
-        if cold_load_match:
-            extracted_data["COLD_LOAD"] = float(cold_load_match.group(1))
-            
-        # 5. HOT POINT (mm) 추출
-        hot_point_match = re.search(r'HOT\s*POINT\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
-        if hot_point_match:
-            extracted_data["HOT_POINT"] = float(hot_point_match.group(1))
-            
-        # 6. COLD POINT (mm) 추출
-        cold_point_match = re.search(r'COLD\s*POINT\s*[:\s]*([\d\.]+)', text, re.IGNORECASE)
-        if cold_point_match:
-            extracted_data["COLD_POINT"] = float(cold_point_match.group(1))
-            
-    return extracted_data
-
-
-def update_excel_sheet(excel_path, data):
-    """추출된 데이터를 엑셀 시트에 매칭하여 기입하는 함수"""
-    wb = openpyxl.load_workbook(excel_path)
-    ws = wb.active
-    
-    tag_to_find = data["SUPPORT_TAG"]
-    if not tag_to_find:
-        print("❌ 도면에서 SUPPORT TAG NO를 찾지 못했습니다.")
-        return
-
-    print(f"🔍 찾은 SUPPORT TAG NO: {tag_to_find}")
-    print(f"📊 추출 데이터: {data}")
-    
-    matched_row = None
-    for row in range(5, ws.max_row + 1):
-        cell_value = str(ws.cell(row=row, column=4).value or '').strip()
-        if tag_to_find in cell_value or cell_value in tag_to_find:
-            matched_row = row
-            break
-            
-    if matched_row:
-        print(f"✅ 엑셀 {matched_row}번 행 매칭 성공")
+        df = pd.DataFrame(results)
         
-        # 엑셀 열 기입
-        ws.cell(row=matched_row, column=7, value=data["SPRING_RATE"])
-        ws.cell(row=matched_row, column=9, value=data["HOT_LOAD"])
-        ws.cell(row=matched_row, column=11, value=data["COLD_LOAD"])
-        ws.cell(row=matched_row, column=13, value=data["HOT_POINT"])
-        ws.cell(row=matched_row, column=15, value=data["COLD_POINT"])
+        st.subheader("📋 추출 결과 요약")
+        st.dataframe(df, use_container_width=True)
         
-        output_path = "updated_" + excel_path
-        wb.save(output_path)
-        print(f"🎉 기입 완료! 저장 파일: {output_path}")
-    else:
-        print(f"⚠️ 엑셀에서 '{tag_to_find}'와 일치하는 항목을 찾지 못했습니다.")
-
-
-if __name__ == "__main__":
-    pdf_file = "3PAGE.pdf"
-    excel_file = "5. #23,22. Spring Hanger 성능시험지(LB) .xlsx"
-    
-    parsed_data = extract_drawing_data(pdf_file)
-    update_excel_sheet(excel_file, parsed_data)
+        # 메모리 상에서 엑셀 파일 생성
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Support_List')
+        excel_data = output.getvalue()
+        
+        # 3. 엑셀 다운로드 버튼
+        st.download_button(
+            label="📥 엑셀 리스트 다운로드 (.xlsx)",
+            data=excel_data,
+            file_name="Pipe_Support_Drawing_List.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
