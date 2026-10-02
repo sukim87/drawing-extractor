@@ -5,7 +5,7 @@ import openpyxl
 import streamlit as st
 import fitz  # PyMuPDF
 import pytesseract
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageOps
 
 st.set_page_config(page_title="Pipe Support 도면 데이터 자율 추출기", layout="wide")
 st.title("📐 Pipe Support 도면 데이터 자율 추출기")
@@ -17,24 +17,35 @@ uploaded_pdfs = st.file_uploader(
 )
 
 def preprocess_image_for_ocr(img):
-    """OCR 인식률 극대화를 위한 이미지 전처리 (대비 강조)"""
+    """도면 OCR 인식률을 극대화하는 이미지 전처리"""
+    # 1. 흑백 전환
     gray = img.convert('L')
+    
+    # 2. 선명도 및 대비 2.5배 강화
     enhancer = ImageEnhance.Contrast(gray)
-    enhanced = enhancer.enhance(2.0)
-    threshold = 180
+    enhanced = enhancer.enhance(2.5)
+    
+    # 3. 임계값(Thresholding)을 이용한 이진화 (글자 명확화)
+    threshold = 170
     binarized = enhanced.point(lambda p: 255 if p > threshold else 0)
     return binarized
 
+def crop_table_area(img):
+    """도면의 표(Hanger Setting Data / BOM)가 위치한 우측 하단 50% 영역 크롭"""
+    width, height = img.size
+    # (left, upper, right, lower)
+    crop_box = (int(width * 0.45), int(height * 0.40), width, height)
+    return img.crop(crop_box)
+
 def safe_float(value_str):
-    """날짜('26.08.18')나 문자가 포함된 경우 안전하게 float으로 변환하는 함수"""
+    """날짜 형식('26.08.18')이나 노이즈 텍스트 예외 처리"""
     if not value_str:
         return None
     try:
-        # 날짜처럼 점(.)이 2개 이상 있는 문자열 제거
         clean_str = str(value_str).strip()
+        # 점(.)이 2개 이상 들어간 날짜 표기 제거
         if clean_str.count('.') > 1:
             return None
-        # 순수 숫자와 점(.)만 추출
         clean_str = re.sub(r'[^0-9\.]', '', clean_str)
         if clean_str:
             return float(clean_str)
@@ -43,7 +54,7 @@ def safe_float(value_str):
     return None
 
 def parse_text_to_fields(text, identifier):
-    """도면 표 구조에 특화된 정규표현식 파싱"""
+    """도면 표 구조에 맞춘 정규표현식 파싱"""
     data = {
         "구분": identifier,
         "1. SUPPORT TAG NO": None,
@@ -55,7 +66,7 @@ def parse_text_to_fields(text, identifier):
         "HANGER MK. NO.": None
     }
     
-    # 1. HANGER MK. NO. / SUPPORT TAG NO (예: SH7-3404-03, SM7-5356-01)
+    # 1. SUPPORT TAG NO / HANGER MK. NO. (예: SH7-3404-03, SM7-5356-01, H260616HD-1)
     mk_m = re.search(r'(?:HANGER\s*MK\.?\s*NO\.?|TAG\s*NO\.?|MARK\s*NO\.?)[:\s]*([A-Z0-9-]+)', text, re.IGNORECASE)
     if mk_m:
         val = mk_m.group(1).strip()
@@ -68,27 +79,27 @@ def parse_text_to_fields(text, identifier):
             data["HANGER MK. NO."] = tag_direct.group(0).strip()
 
     # 2. Type & Size (예: VT-120-C91CG, VT-080-081, VT-030-091CG 등)
-    type_m = re.search(r'(?:VT|VC|VA|CS|CH|CHT|JSLD|JCSC|JLSTW|VB09)-[\w-]+', text, re.IGNORECASE)
+    type_m = re.search(r'(?:VT|VC|VA|CS|CH|CHT|JSLD|JCSC|JLSTW|VB09|VS)-[\w-]+', text, re.IGNORECASE)
     if type_m:
         data["2. Type & Size"] = type_m.group(0).strip()
 
     # 3. SPRING RATE (kgf/mm)
-    sp_m = re.search(r'SPRING\s*RATE\s*[:\s]*(\d+\.?\d*)', text, re.IGNORECASE)
+    sp_m = re.search(r'SPRING\s*RATE[^\d]*([\d\.]+)', text, re.IGNORECASE)
     if sp_m:
         data["3. Spring Rate (kgf/mm)"] = safe_float(sp_m.group(1))
 
     # 4. HOT LOAD (kgf)
-    hl_m = re.search(r'HOT\s*LOAD\s*[:\s]*(\d+\.?\d*)', text, re.IGNORECASE)
+    hl_m = re.search(r'HOT\s*LOAD[^\d]*([\d\.]+)', text, re.IGNORECASE)
     if hl_m:
         data["4. Hot Load (kgf)"] = safe_float(hl_m.group(1))
 
     # 5. COLD LOAD (kgf)
-    cl_m = re.search(r'COLD\s*LOAD\s*[:\s]*(\d+\.?\d*)', text, re.IGNORECASE)
+    cl_m = re.search(r'COLD\s*LOAD[^\d]*([\d\.]+)', text, re.IGNORECASE)
     if cl_m:
         data["5. Cold Load (kgf)"] = safe_float(cl_m.group(1))
 
     # 6. MOVEMENT / TRAVEL (mm)
-    mov_m = re.search(r'(?:THERMAL\s*MAXIMUM|PIPE\s*MOVEMENT|MAX\.\s*TRAVEL)\s*[:\s]*(\d+\.?\d*)', text, re.IGNORECASE)
+    mov_m = re.search(r'(?:THERMAL\s*MOVEMENT|MAX\.\s*TRAVEL|MOVEMENT)[^\d]*([\d\.]+)', text, re.IGNORECASE)
     if mov_m:
         data["6. Movement (mm)"] = safe_float(mov_m.group(1))
 
@@ -106,19 +117,28 @@ def process_pdf(pdf_file):
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             text = page.get_text()
+            identifier = f"{pdf_file.name} (p.{page_idx+1})"
             
-            identifier = f"{pdf_file.name} (p.{page_idx+1}-OCR)"
+            # 1단계: PDF 내부 텍스트 직접 추출 시도
+            parsed = parse_text_to_fields(text, identifier)
             
-            # PDF 텍스트 파싱
-            if text and len(text.strip()) > 50:
-                parsed = parse_text_to_fields(text, identifier)
-            else:
-                # OCR 파싱
+            # 주요 값(TAG NO 또는 Spring Rate 등)이 비어있는 경우 2단계 고해상도 OCR 수행
+            if not parsed["1. SUPPORT TAG NO"] or not parsed["3. Spring Rate (kgf/mm)"]:
+                # 300 DPI 고해상도 렌더링
                 pix = page.get_pixmap(dpi=300)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
-                processed_img = preprocess_image_for_ocr(img)
-                ocr_text = pytesseract.image_to_string(processed_img, lang='eng')
-                parsed = parse_text_to_fields(ocr_text, identifier)
+                
+                # 표 영역만 크롭 후 전처리
+                cropped_img = crop_table_area(img)
+                processed_img = preprocess_image_for_ocr(cropped_img)
+                
+                # OCR 실행 (PSM 6: 단일 텍스트 블록 모드 적용)
+                custom_config = r'--oem 3 --psm 6'
+                ocr_text = pytesseract.image_to_string(processed_img, lang='eng', config=custom_config)
+                
+                # 전체 이미지 추출 텍스트와 크롭 OCR 텍스트 병합 후 다시 파싱
+                combined_text = text + "\n" + ocr_text
+                parsed = parse_text_to_fields(combined_text, identifier + "-OCR")
                 
             rows.append(parsed)
                 
