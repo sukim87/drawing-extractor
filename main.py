@@ -14,13 +14,15 @@ uploaded_pdfs = st.file_uploader(
     accept_multiple_files=True
 )
 
-def parse_rabigh_drawing_text(text, identifier):
+def extract_numbers_from_str(s):
+    """문자열에서 숫자(소수점 포함) 추출"""
+    m = re.search(r'(\d+(?:\.\d+)?)', str(s))
+    return float(m.group(1)) if m else None
+
+def parse_robust_drawing(page, identifier):
     """
-    Rabigh 2 / BHI 도면 특화 키워드 추적 파싱 로직
+    라벨 위치 기반 유연 탐색 로직 (텍스트 씹힘 방지)
     """
-    # 텍스트 내의 과도한 공백 및 줄바꿈 정리
-    clean_text = " ".join(text.split())
-    
     data = {
         "구분": identifier,
         "1. SUPPORT TAG NO": None,
@@ -31,40 +33,77 @@ def parse_rabigh_drawing_text(text, identifier):
         "6. Movement (mm)": None,
     }
 
-    # 1. SUPPORT TAG NO (SUPPORT TAG NO. 뒤 또는 11LAB... 식별자)
-    tag_m = re.search(r'SUPPORT\s*TAG\s*\.?\s*NO\.?\s*([A-Z0-9-]+)', clean_text, re.IGNORECASE)
-    if tag_m:
-        data["1. SUPPORT TAG NO"] = tag_m.group(1).strip()
-    else:
-        tag_direct = re.search(r'\b(\d{2}[A-Z]{3}\d{2}[A-Z]{2}\d{3}-[A-Z0-9]+)\b', clean_text)
-        if tag_direct:
-            data["1. SUPPORT TAG NO"] = tag_direct.group(1).strip()
+    # 전체 페이지 텍스트 & 단어 바운딩 박스 추출
+    raw_text = page.get_text("text")
+    words = page.get_text("words")  # (x0, y0, x1, y1, word, block_no, line_no, word_no)
 
-    # 2. Type & Size (VIS SUPPORT 또는 VT- 규격)
-    type_m = re.search(r'\b(VT-\d{3}-[A-Z0-9]+)\b', clean_text, re.IGNORECASE)
-    if type_m:
-        data["2. Type & Size"] = type_m.group(1).strip()
+    # 1. SUPPORT TAG NO
+    # 'SUPPORT TAG' 근처 단어에서 식별자 검색
+    tag_rects = page.search_for("SUPPORT TAG") or page.search_for("TAG NO")
+    if tag_rects:
+        r = tag_rects[0]
+        # 해당 라벨 우측 및 아래쪽 범위를 넉넉하게 잡아서 탐색
+        nearby = [w[4] for w in words if (r.x0 - 20 <= w[0] <= r.x1 + 300) and (r.y0 - 10 <= w[1] <= r.y1 + 80)]
+        for w in nearby:
+            m = re.search(r'([0-9A-Z]{5,}-[A-Z0-9]+)', w)
+            if m:
+                data["1. SUPPORT TAG NO"] = m.group(1)
+                break
+    
+    # 예비책: 전체 단어 중 11LAB... 또는 SH... 패턴 직접 탐색
+    if not data["1. SUPPORT TAG NO"]:
+        m_direct = re.search(r'\b(11LAB[A-Z0-9-]+)\b', raw_text) or re.search(r'\b(S[HM]\d*-[A-Z0-9-]+)\b', raw_text)
+        if m_direct:
+            data["1. SUPPORT TAG NO"] = m_direct.group(1)
+
+    # 2. Type & Size (BOM 영역의 VT-030-17LCG 패턴 탐색)
+    vt_match = re.search(r'\b(VT-\d{3}-[\w]+)\b', raw_text, re.IGNORECASE)
+    if vt_match:
+        data["2. Type & Size"] = vt_match.group(1).upper()
 
     # 3. SPRING RATE
-    sp_m = re.search(r'SPRING\s*RATE\s*(\d+(?:\.\d+)?)', clean_text, re.IGNORECASE)
-    if sp_m:
-        data["3. Spring Rate (N/mm)"] = float(sp_m.group(1))
+    sp_rects = page.search_for("SPRING RATE")
+    if sp_rects:
+        r = sp_rects[0]
+        nearby = [w[4] for w in words if (r.x0 - 20 <= w[0] <= r.x1 + 250) and (r.y0 - 5 <= w[1] <= r.y1 + 40)]
+        for w in nearby:
+            val = extract_numbers_from_str(w)
+            if val is not None:
+                data["3. Spring Rate (N/mm)"] = val
+                break
 
     # 4. HOT LOAD
-    hl_m = re.search(r'HOT\s*LOAD\s*(\d+(?:\.\d+)?)', clean_text, re.IGNORECASE)
-    if hl_m:
-        data["4. Hot Load (N)"] = float(hl_m.group(1))
+    hl_rects = page.search_for("HOT LOAD")
+    if hl_rects:
+        r = hl_rects[0]
+        nearby = [w[4] for w in words if (r.x0 - 20 <= w[0] <= r.x1 + 250) and (r.y0 - 5 <= w[1] <= r.y1 + 40)]
+        for w in nearby:
+            val = extract_numbers_from_str(w)
+            if val is not None:
+                data["4. Hot Load (N)"] = val
+                break
 
     # 5. COLD LOAD
-    cl_m = re.search(r'COLD\s*LOAD\s*(\d+(?:\.\d+)?)', clean_text, re.IGNORECASE)
-    if cl_m:
-        data["5. Cold Load (N)"] = float(cl_m.group(1))
+    cl_rects = page.search_for("COLD LOAD")
+    if cl_rects:
+        r = cl_rects[0]
+        nearby = [w[4] for w in words if (r.x0 - 20 <= w[0] <= r.x1 + 250) and (r.y0 - 5 <= w[1] <= r.y1 + 40)]
+        for w in nearby:
+            val = extract_numbers_from_str(w)
+            if val is not None:
+                data["5. Cold Load (N)"] = val
+                break
 
-    # 6. MOVEMENT (+Y UP 또는 THERMAL 수치)
-    # +Y UP 뒤의 수치를 우선 매칭
-    mov_m = re.search(r'\+Y\s*(?:UP)?\s*(\d+(?:\.\d+)?)', clean_text, re.IGNORECASE)
-    if mov_m:
-        data["6. Movement (mm)"] = float(mov_m.group(1))
+    # 6. MOVEMENT (+Y UP 근처 탐색)
+    y_rects = page.search_for("+Y") or page.search_for("THERMAL")
+    if y_rects:
+        r = y_rects[0]
+        nearby = [w[4] for w in words if (r.x1 <= w[0] <= r.x1 + 200) and (r.y0 - 15 <= w[1] <= r.y1 + 15)]
+        for w in nearby:
+            val = extract_numbers_from_str(w)
+            if val is not None:
+                data["6. Movement (mm)"] = val
+                break
 
     return data
 
@@ -78,10 +117,7 @@ def process_pdf(pdf_file):
         for page_idx in range(len(doc)):
             page = doc[page_idx]
             identifier = f"{pdf_file.name} (p.{page_idx+1})"
-            
-            # PDF 텍스트 직접 추출
-            text = page.get_text("text")
-            parsed = parse_rabigh_drawing_text(text, identifier)
+            parsed = parse_robust_drawing(page, identifier)
             rows.append(parsed)
         doc.close()
     except Exception as e:
